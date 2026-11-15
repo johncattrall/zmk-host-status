@@ -32,8 +32,9 @@
 #include <zmk/keymap.h>
 #include <zmk/ble.h>
 
+#include <zephyr/bluetooth/conn.h>
+
 #if IS_ENABLED(CONFIG_ZMK_SPLIT)
-#include <zmk/events/split_peripheral_status_changed.h>
 #define HS_PERIPH_EXPECTED ZMK_SPLIT_BLE_PERIPHERAL_COUNT
 #else
 #define HS_PERIPH_EXPECTED 0
@@ -63,7 +64,12 @@ struct hs_payload {
 } __packed;
 
 static uint32_t locked_mask;
-static uint8_t periph_connected;
+/* Split halves linked to this central. Counted from BLE connections in
+ * which this device is the BLE central: ZMK's central half is the BLE
+ * central only toward its peripheral halves (hosts connect to it as
+ * peripheral). zmk_split_peripheral_status_changed is NOT usable here: in
+ * ZMK v0.3 it is raised on the peripheral half only. */
+static atomic_t periph_connected;
 static uint32_t held_positions[HS_MAX_POSITIONS / 32];
 static struct hs_payload last_sent;
 static bool notify_enabled;
@@ -98,10 +104,11 @@ static void build_payload(struct hs_payload *p) {
         locked_mask = active & ~BIT(0);
     }
     p->version = HS_VERSION;
-    p->flags = (HS_PERIPH_EXPECTED > 0 && periph_connected >= HS_PERIPH_EXPECTED) ? BIT(0) : 0;
+    uint8_t linked = (uint8_t)MIN(atomic_get(&periph_connected), HS_PERIPH_EXPECTED);
+    p->flags = (HS_PERIPH_EXPECTED > 0 && linked >= HS_PERIPH_EXPECTED) ? BIT(0) : 0;
     p->active = sys_cpu_to_le32(active);
     p->locked = sys_cpu_to_le32(locked_mask);
-    p->periph_connected = periph_connected;
+    p->periph_connected = linked;
     p->periph_expected = HS_PERIPH_EXPECTED;
 }
 
@@ -202,26 +209,36 @@ static int host_status_listener(const zmk_event_t *eh) {
         return ZMK_EV_EVENT_BUBBLE;
     }
 
-#if IS_ENABLED(CONFIG_ZMK_SPLIT)
-    const struct zmk_split_peripheral_status_changed *ps =
-        as_zmk_split_peripheral_status_changed(eh);
-    if (ps) {
-        if (ps->connected) {
-            if (periph_connected < HS_PERIPH_EXPECTED) {
-                periph_connected++;
-            }
-        } else if (periph_connected > 0) {
-            periph_connected--;
-        }
-        schedule_notify();
-    }
-#endif
     return ZMK_EV_EVENT_BUBBLE;
 }
 
 ZMK_LISTENER(host_status, host_status_listener);
 ZMK_SUBSCRIPTION(host_status, zmk_position_state_changed);
 ZMK_SUBSCRIPTION(host_status, zmk_layer_state_changed);
+
+/* ---- split link tracking via BLE connection role ---- */
 #if IS_ENABLED(CONFIG_ZMK_SPLIT)
-ZMK_SUBSCRIPTION(host_status, zmk_split_peripheral_status_changed);
+static bool is_split_link(struct bt_conn *conn) {
+    struct bt_conn_info info;
+    return bt_conn_get_info(conn, &info) == 0 && info.role == BT_CONN_ROLE_CENTRAL;
+}
+
+static void hs_connected(struct bt_conn *conn, uint8_t err) {
+    if (err == 0 && is_split_link(conn)) {
+        atomic_inc(&periph_connected);
+        schedule_notify();
+    }
+}
+
+static void hs_disconnected(struct bt_conn *conn, uint8_t reason) {
+    if (is_split_link(conn) && atomic_get(&periph_connected) > 0) {
+        atomic_dec(&periph_connected);
+        schedule_notify();
+    }
+}
+
+BT_CONN_CB_DEFINE(host_status_conn_cb) = {
+    .connected = hs_connected,
+    .disconnected = hs_disconnected,
+};
 #endif
