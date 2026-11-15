@@ -5,3 +5,12 @@ config ZMK_HOST_STATUS
     help
       Adds a small GATT service that host apps (e.g. a menu bar indicator)
       can read and subscribe to. Notifies only when status changes.
+
+config ZMK_HOST_STATUS_MODIFIERS
+    bool "Report held modifiers"
+    default y
+    depends on ZMK_HOST_STATUS
+    help
+      Include the held modifier state in the status payload. Each change of
+      a held modifier (including home row mods resolving to a hold) sends a
+      short notification. Disable to save the extra Bluetooth traffic.

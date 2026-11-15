@@ -2,18 +2,26 @@
  * zmk-host-status: expose keyboard status to host apps over BLE GATT.
  *
  * Service 6e1a0001-7c5b-4f2e-9a3d-2b8c4d1e5f60
- *   ...0002 status  (read, notify)  12-byte packed struct, see below
+ *   ...0002 status  (read, notify)  15-byte packed struct, see below
  *   ...0003 names   (read)          layer names, '\n'-separated, index order
  *   ...0004 build   (read)          firmware build id (git short SHA)
  *
- * Status payload v1 (little endian):
- *   u8  version            = 1
+ * Status payload v2 (little endian). v1 was the first 12 bytes; later
+ * versions only append, so v1 readers keep working:
+ *   u8  version            = 2
  *   u8  flags              bit0: all expected split peripherals connected
  *   u32 active             bit i = layer at index i active
  *   u32 locked             active layers that stay on with no key held
  *                          (toggles, NumWord-style auto layers, temp layers)
  *   u8  periph_connected
  *   u8  periph_expected    0 on non-split boards
+ *   -- v2 --
+ *   u8  mods               held explicit modifiers, HID bit order (LCtrl,
+ *                          LShift, LAlt, LGui, RCtrl, RShift, RAlt, RGui);
+ *                          always 0 with CONFIG_ZMK_HOST_STATUS_MODIFIERS=n
+ *   u8  flags2             bit0: output is USB (else BLE)
+ *                          bit1: active BLE profile is connected
+ *   u8  ble_profile        active BLE profile index
  *
  * Notifies only on change, coalesced over 30 ms. SPDX-License-Identifier: MIT
  */
@@ -29,8 +37,13 @@
 #include <zmk/event_manager.h>
 #include <zmk/events/layer_state_changed.h>
 #include <zmk/events/position_state_changed.h>
+#include <zmk/events/keycode_state_changed.h>
+#include <zmk/events/ble_active_profile_changed.h>
+#include <zmk/events/endpoint_changed.h>
 #include <zmk/keymap.h>
 #include <zmk/ble.h>
+#include <zmk/hid.h>
+#include <zmk/endpoints.h>
 
 #include <zephyr/bluetooth/conn.h>
 
@@ -42,7 +55,7 @@
 
 LOG_MODULE_REGISTER(zmk_host_status, CONFIG_ZMK_LOG_LEVEL);
 
-#define HS_VERSION 1
+#define HS_VERSION 2
 #ifndef CONFIG_ZMK_KEYMAP_LAYER_NAME_MAX_LEN
 #define CONFIG_ZMK_KEYMAP_LAYER_NAME_MAX_LEN 20
 #endif
@@ -61,6 +74,10 @@ struct hs_payload {
     uint32_t locked;
     uint8_t periph_connected;
     uint8_t periph_expected;
+    /* v2 */
+    uint8_t mods;
+    uint8_t flags2;
+    uint8_t ble_profile;
 } __packed;
 
 static uint32_t locked_mask;
@@ -110,6 +127,19 @@ static void build_payload(struct hs_payload *p) {
     p->locked = sys_cpu_to_le32(locked_mask);
     p->periph_connected = linked;
     p->periph_expected = HS_PERIPH_EXPECTED;
+#if IS_ENABLED(CONFIG_ZMK_HOST_STATUS_MODIFIERS)
+    p->mods = zmk_hid_get_explicit_mods();
+#else
+    p->mods = 0;
+#endif
+    p->flags2 = 0;
+    if (zmk_endpoints_selected().transport == ZMK_TRANSPORT_USB) {
+        p->flags2 |= BIT(0);
+    }
+    if (zmk_ble_active_profile_is_connected()) {
+        p->flags2 |= BIT(1);
+    }
+    p->ble_profile = (uint8_t)zmk_ble_active_profile_index();
 }
 
 /* ---- GATT ---- */
@@ -204,10 +234,22 @@ static int host_status_listener(const zmk_event_t *eh) {
         return ZMK_EV_EVENT_BUBBLE;
     }
 
-    if (as_zmk_layer_state_changed(eh)) {
+    if (as_zmk_layer_state_changed(eh) || as_zmk_ble_active_profile_changed(eh) ||
+        as_zmk_endpoint_changed(eh)) {
         schedule_notify();
         return ZMK_EV_EVENT_BUBBLE;
     }
+
+#if IS_ENABLED(CONFIG_ZMK_HOST_STATUS_MODIFIERS)
+    /* zmk_modifiers_state_changed is declared but never raised in ZMK v0.3,
+     * so watch modifier key usages instead and read the HID state in the
+     * (deferred) work, after the HID listener has applied the change.
+     * Ordinary letters are filtered out: typing costs no extra work. */
+    const struct zmk_keycode_state_changed *kc = as_zmk_keycode_state_changed(eh);
+    if (kc && kc->usage_page == HID_USAGE_KEY && kc->keycode >= 0xE0 && kc->keycode <= 0xE7) {
+        schedule_notify();
+    }
+#endif
 
     return ZMK_EV_EVENT_BUBBLE;
 }
@@ -215,30 +257,38 @@ static int host_status_listener(const zmk_event_t *eh) {
 ZMK_LISTENER(host_status, host_status_listener);
 ZMK_SUBSCRIPTION(host_status, zmk_position_state_changed);
 ZMK_SUBSCRIPTION(host_status, zmk_layer_state_changed);
+ZMK_SUBSCRIPTION(host_status, zmk_ble_active_profile_changed);
+ZMK_SUBSCRIPTION(host_status, zmk_endpoint_changed);
+#if IS_ENABLED(CONFIG_ZMK_HOST_STATUS_MODIFIERS)
+ZMK_SUBSCRIPTION(host_status, zmk_keycode_state_changed);
+#endif
 
-/* ---- split link tracking via BLE connection role ---- */
-#if IS_ENABLED(CONFIG_ZMK_SPLIT)
+/* ---- connection tracking ---- */
 static bool is_split_link(struct bt_conn *conn) {
+#if IS_ENABLED(CONFIG_ZMK_SPLIT)
     struct bt_conn_info info;
     return bt_conn_get_info(conn, &info) == 0 && info.role == BT_CONN_ROLE_CENTRAL;
+#else
+    return false;
+#endif
 }
 
 static void hs_connected(struct bt_conn *conn, uint8_t err) {
     if (err == 0 && is_split_link(conn)) {
         atomic_inc(&periph_connected);
-        schedule_notify();
     }
+    /* Host connections change the profile-connected flag too. */
+    schedule_notify();
 }
 
 static void hs_disconnected(struct bt_conn *conn, uint8_t reason) {
     if (is_split_link(conn) && atomic_get(&periph_connected) > 0) {
         atomic_dec(&periph_connected);
-        schedule_notify();
     }
+    schedule_notify();
 }
 
 BT_CONN_CB_DEFINE(host_status_conn_cb) = {
     .connected = hs_connected,
     .disconnected = hs_disconnected,
 };
-#endif
