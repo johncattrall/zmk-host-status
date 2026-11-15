@@ -1,0 +1,7 @@
+config ZMK_HOST_STATUS
+    bool "Expose keyboard status (layers, split link, build) to host apps over BLE GATT"
+    default y
+    depends on ZMK_BLE && (!ZMK_SPLIT || ZMK_SPLIT_ROLE_CENTRAL)
+    help
+      Adds a small GATT service that host apps (e.g. a menu bar indicator)
+      can read and subscribe to. Notifies only when status changes.
